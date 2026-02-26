@@ -1,5 +1,6 @@
 # OpenClaw 心跳巡检机制调研
 
+> plusluo
 > 调研基于 OpenClaw 2026.2.24 (df9a474) 源码
 > 源码仓库：https://github.com/openclaw/openclaw
 

@@ -1,5 +1,6 @@
 # OpenClaw 对 Pi Agent 的运用思想与关键改动
 
+> plusluo
 > 基于 OpenClaw 源码（版本 2026.2.25）分析，所有描述均以实际代码为依据。
 
 ---

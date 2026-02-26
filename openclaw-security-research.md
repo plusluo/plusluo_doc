@@ -1,5 +1,6 @@
 # OpenClaw Security 安全体系深度解析
 
+> plusluo
 > 基于 OpenClaw 源码（版本 2026.2.25）分析，所有描述均以实际代码为依据。
 
 ---
