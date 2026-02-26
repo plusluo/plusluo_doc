@@ -1,36 +1,82 @@
-# OpenClaw 会话防抖机制调研
+# OpenClaw 会话防抖机制深度解析
 
-> 调研时间：2026-02-25
-> OpenClaw 版本：2026.2.24 (df9a474)
+> 调研基于 OpenClaw 2026.2.24 (df9a474) 源码
 > 源码仓库：https://github.com/openclaw/openclaw
 
-## 背景
+---
 
-OpenClaw 据说支持"会话防抖"——用户分多条发送消息时，系统等用户发完再统一回复。实际测试发现该功能未生效，通过源码分析找出原因。
+## 一、问题是什么？
 
-## 核心发现
+用户在 IM 中习惯**分多条消息发送**一个完整意图，例如：
 
-OpenClaw 有 **两层独立的消息缓冲机制**，作用于不同阶段：
-
-### 第一层：Inbound Debounce（入站防抖）
-
-- **源码位置**：`src/auto-reply/inbound-debounce.ts`
-- **作用阶段**：消息到达时，提交给 AI 之前
-- **机制**：固定时间窗口，纯计时器，无语义检测
-- **适用通道**：仅 IM 通道（iMessage、WhatsApp、Telegram、Signal、Discord）
-- **不适用**：浏览器 UI、CLI TUI（走 Gateway WebSocket `chat.send` 路径）
-- **配置项**：`messages.inbound.debounceMs` 和 `messages.inbound.byChannel`
-- **默认值**：`0`（禁用）
-
-工作流程：
 ```
-消息1 → 入buffer，启动 setTimeout(debounceMs)
-消息2 → 入buffer，重置 setTimeout
-消息3 → 入buffer，重置 setTimeout
-debounceMs 到期 → 合并为 "消息1\n消息2\n消息3" → 提交给 AI
+用户：帮我看一下              ← 第 1 条
+用户：昨天的日报              ← 第 2 条
+用户：重点标出延期的项目        ← 第 3 条
 ```
 
-配置示例（`~/.openclaw/openclaw.json`）：
+如果 AI 收到第 1 条就立刻回复，会导致：
+- **回答片面**：只看到"帮我看一下"，不知道看什么
+- **资源浪费**：后续消息到达后又要重新回答
+- **体验割裂**：用户看到多次不完整的回复
+
+**防抖（Debounce）** 的目标：**等用户发完，再统一交给 AI 处理。**
+
+---
+
+## 二、OpenClaw 的两层缓冲架构
+
+OpenClaw 在消息流转路径上设置了**两道独立的缓冲关卡**，分别作用于不同阶段：
+
+```
+用户消息
+  │
+  ▼
+┌──────────────────────────────┐
+│  第一层：Inbound Debounce     │  ← 消息到达时，提交 AI 之前
+│  仅 IM 通道，默认关闭          │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│  第二层：Followup Queue       │  ← AI 处理中，新消息排队等待
+│  所有通道，默认开启            │
+└──────────┬───────────────────┘
+           │
+           ▼
+       AI 处理
+```
+
+### 2.1 第一层：Inbound Debounce（入站防抖）
+
+**核心思想**：消息到达后不立即处理，而是启动计时器等待，每来一条新消息就重置计时器，直到静默期满再合并提交。
+
+**关键特性**：
+
+| 属性 | 说明 |
+|------|------|
+| 源码位置 | `src/auto-reply/inbound-debounce.ts` |
+| 触发阶段 | 消息到达 → 提交 AI 之前 |
+| 适用通道 | 仅 IM（iMessage / WhatsApp / Telegram / Signal / Discord） |
+| 默认值 | `debounceMs = 0`（**禁用**） |
+| 判断逻辑 | 纯结构检查，无语义分析 |
+
+**时序示意**：
+
+```
+时间轴 ──────────────────────────────────────►
+
+消息1 ──┐
+        │ 启动计时器(2000ms)
+消息2 ──┤ 重置计时器
+        │
+消息3 ──┤ 重置计时器
+        │
+        ├── 2000ms 静默 ──► 合并为 "消息1\n消息2\n消息3" → 提交 AI
+```
+
+**配置方法**（`~/.openclaw/openclaw.json`）：
+
 ```json
 {
   "messages": {
@@ -45,86 +91,108 @@ debounceMs 到期 → 合并为 "消息1\n消息2\n消息3" → 提交给 AI
 }
 ```
 
-### 第二层：Followup Queue（后续消息队列）
+> **注意**：配置不热更新，修改后需执行 `openclaw gateway restart`。
 
-- **源码位置**：`src/auto-reply/reply/queue/` 目录
-- **作用阶段**：AI 正在处理一条消息时，新到达的消息排队等待
-- **适用通道**：所有通道（包括 Gateway WebSocket）
-- **默认模式**：`collect`（合并排队消息为一个请求）
-- **默认 debounce**：`1000ms`
-- **配置项**：`messages.queue.mode`、`messages.queue.debounceMs`
+### 2.2 第二层：Followup Queue（后续消息队列）
 
-当 AI 正在处理消息 A 时：
+**核心思想**：当 AI 正在处理一条消息时，新到达的消息不丢弃，而是放入队列，等当前处理完成后合并消费。
+
+**关键特性**：
+
+| 属性 | 说明 |
+|------|------|
+| 源码位置 | `src/auto-reply/reply/queue/` |
+| 触发条件 | AI 正在处理中（`isActive = true`） |
+| 适用通道 | **所有通道**（包括 Gateway WebSocket） |
+| 默认模式 | `collect`（合并排队消息为一个请求） |
+| 默认等待 | `1000ms` |
+
+**时序示意**：
+
 ```
-消息B 到达 → isActive=true → 进入 followup queue
-消息C 到达 → isActive=true → 进入 followup queue
-消息A 处理完成 → scheduleFollowupDrain()
-  → waitForQueueDebounce(1000ms) → 等1秒看有无新消息
-  → collect 模式：合并 B+C 为一个请求 → 交给 AI
-```
-
-## 各客户端行为对比
-
-| 客户端 | 第一条消息 | 后续消息 | 合并方式 |
-|--------|-----------|---------|---------|
-| 浏览器 UI | 立即处理 | 前端 JS 拦截入 `chatQueue`，逐条串行发送，**不合并** | 无 |
-| CLI TUI | 立即处理 | 直达 Gateway → 服务端 followup queue | `collect` 模式合并 |
-| IM 通道 + debounceMs>0 | **等待 debounceMs** | 合并到同一批次 | inbound debounce 合并 |
-
-### 浏览器 UI 的前端队列机制
-
-源码：`ui/src/ui/app-chat.ts`
-
-```typescript
-// 第 29-31 行
-export function isChatBusy(host: ChatHost) {
-  return host.chatSending || Boolean(host.chatRunId);
-}
-
-// 第 190-193 行
-if (isChatBusy(host)) {
-  enqueueChatMessage(host, message, attachmentsToSend, refreshSessions);
-  return;  // 消息根本没发到 Gateway
-}
+消息A → AI 开始处理 ──────────────────────► AI 完成
+                    ↑                        │
+消息B 到达 → 入队    │                        ▼
+消息C 到达 → 入队    │              等待 1000ms（看有无新消息）
+                    │                        │
+                    │                        ▼
+                    │              合并 B+C → 提交 AI
 ```
 
-发第一条消息后 `chatSending` 立即为 `true`，后续消息被前端拦截放入 `chatQueue` 数组，等 AI 回复完成后逐条串行发送。
+---
 
-### CLI TUI 的行为
+## 三、不同客户端的消息处理差异
 
-源码：`src/tui/tui-command-handlers.ts`
+这是理解防抖行为的关键——**同一个 OpenClaw 后端，三种客户端走的路径完全不同**：
 
-CLI TUI 没有 `isChatBusy` 检查，消息直接通过 WebSocket 发到 Gateway。但 Gateway 服务端的 `resolveActiveRunQueueAction` 会把它放入 followup queue。好处是 `collect` 模式会把排队的多条消息合并处理。
+| 客户端 | 第一条消息 | 后续快速消息 | 消息合并 | 体验评级 |
+|--------|-----------|------------|---------|---------|
+| **IM 通道**（开启防抖） | 等待 debounceMs | 合并到同一批次 | 真正防抖合并 | ★★★ 最优 |
+| **CLI TUI** | 立即处理 | 进入服务端 followup queue | collect 模式合并 | ★★ 中等 |
+| **浏览器 UI** | 立即处理 | 前端拦截，逐条串行发送 | **不合并** | ★ 最差 |
 
-## 防抖的判断逻辑
+### 浏览器 UI 为什么最差？
 
-`shouldDebounce` 只判断消息结构属性，**不涉及语言检测或语义分析**：
+浏览器前端（`ui/src/ui/app-chat.ts`）在发送第一条消息后立即设置 `chatSending = true`，后续消息被 `isChatBusy()` 拦截放入本地 `chatQueue` 数组，等回复完成后**逐条串行发送**，完全绕过了服务端的合并机制。
 
-| 判断维度 | 具体检查 | 涉及语义？ |
-|---------|---------|----------|
-| 有没有文本 | `msg.text` 是否为空 | 否 |
-| 有没有媒体/附件 | 图片、文件、位置等 | 否 |
-| 是不是斜杠命令 | `/stop`、`/new` 等精确匹配 | 否 |
-| 是不是转发消息 | Telegram 专用 | 否 |
+### CLI TUI 为什么好一些？
 
-## 配置不热更新
+CLI 没有前端拦截，消息直接通过 WebSocket 到达 Gateway。Gateway 的 `resolveActiveRunQueueAction` 将其放入 followup queue，`collect` 模式会把排队消息合并后一次性提交 AI。
 
-`resolveInboundDebounceMs` 在 monitor 启动时只调用一次，修改配置后必须重启 gateway：
+---
 
-```bash
-openclaw gateway restart
+## 四、防抖判断：纯结构检查，零语义
+
+`shouldDebounce` 函数的判断逻辑非常简单，**完全不涉及自然语言理解**：
+
+| 检查项 | 说明 | 涉及语义 |
+|-------|------|---------|
+| `msg.text` 是否为空 | 无文本则跳过防抖 | 否 |
+| 是否包含媒体/附件 | 图片、文件、位置等 | 否 |
+| 是否为斜杠命令 | `/stop`、`/new` 等精确匹配 | 否 |
+| 是否为转发消息 | Telegram 专用字段 | 否 |
+
+**这意味着**：系统无法判断"帮我看一下"是不是一句完整的话，只能靠固定时间窗口"盲等"。
+
+---
+
+## 五、默认不生效的原因
+
+经源码确认，防抖**功能完整但默认禁用**，原因链条：
+
+```
+debounceMs 默认 = 0
+       ↓
+shouldDebounce() 返回 false
+       ↓
+消息直接提交 AI，不进入缓冲
+       ↓
+用户感知：防抖不生效
 ```
 
-## 业界更优方案
+**要启用**，必须手动配置 `debounceMs > 0` 并重启 gateway。
 
-1. **Typing Indicator 感知**：利用"对方正在输入"信号暂停防抖计时器（OpenClaw 有 typing indicator 代码但仅用于输出端）
-2. **轻量级正则启发式**：检测不完整语句（如以"的""了""呢"结尾的短句），动态延长等待时间
-3. **小模型快速判断**：用极小分类模型判断消息是否完整（<50ms 推理）
-4. **自适应动态窗口**：根据用户历史发送间隔自动调整 debounceMs
+---
 
-## 结论
+## 六、业界更优的防抖策略
 
-- OpenClaw **有**完整的入站防抖实现，但默认禁用（`debounceMs=0`）
-- 防抖**仅对 IM 通道有效**，浏览器 UI 和 CLI TUI 走不同管道
-- 浏览器 UI 最差（前端拦截，逐条串行），CLI TUI 其次（followup queue collect 合并），IM 通道最优（真正的防抖合并）
-- 防抖是纯计时器，无语义检测能力
+OpenClaw 当前方案是最基础的固定窗口计时器，业界已有更智能的做法：
+
+| 方案 | 原理 | 优势 | 复杂度 |
+|------|------|------|-------|
+| **Typing Indicator 感知** | 利用 IM 协议的"正在输入"信号暂停计时器 | 精确感知用户是否还在打字 | 低 |
+| **正则启发式** | 检测不完整语句特征（如"的""了""呢"结尾的短句） | 低成本的语义近似 | 低 |
+| **小模型快速判断** | 用极小分类模型判断消息完整性（<50ms） | 真正的语义理解 | 中 |
+| **自适应动态窗口** | 根据用户历史发送间隔自动调整等待时间 | 个性化，无需手动配置 | 中 |
+
+> OpenClaw 已有 typing indicator 代码，但仅用于输出端（告诉用户"AI 正在回复"），未用于输入端防抖，是一个可挖掘的优化点。
+
+---
+
+## 七、核心结论
+
+1. **有能力但默认关闭**：OpenClaw 实现了完整的入站防抖，但 `debounceMs` 默认为 0
+2. **通道隔离**：防抖仅对 IM 通道生效，浏览器 UI 和 CLI TUI 走不同路径
+3. **浏览器 UI 体验最差**：前端拦截 + 逐条串行，连服务端合并机制都用不上
+4. **纯计时器，无智能**：不具备语义判断能力，只能靠固定时间窗口等待
+5. **配置需重启**：修改 debounceMs 后必须 `openclaw gateway restart` 才能生效
