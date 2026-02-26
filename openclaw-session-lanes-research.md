@@ -112,7 +112,7 @@ export async function runEmbeddedPiAgent(params) {
 | 层级 | 解决的问题 | 并发度 |
 |------|-----------|--------|
 | Session Lane | 防止同一用户的多条消息同时触发多个 Agent 运行，导致会话历史文件读写竞态、工具调用冲突 | 1（不可配置） |
-| Global Lane | 防止跨会话的大量并发请求压垮 LLM 上游接口，导致 429 限速 | 可配置（默认 main=4） |
+| Global Lane | 防止跨会话的大量并发请求压垮 LLM 上游接口，导致 HTTP 429（Too Many Requests，即服务端返回"请求过多，请稍后重试"的限速响应） | 可配置（默认 main=4） |
 
 ---
 
@@ -167,7 +167,7 @@ const lanes = new Map<string, LaneState>(); // 全局 Lane 注册表
 
 ### 4.4 Generation 机制
 
-当 `resetAllLanes()` 被调用时（例如 SIGUSR1 热重启），generation 递增。旧的 in-flight 任务完成时检测到 generation 不匹配，不会触发后续泵送，避免状态错乱。
+当 `resetAllLanes()` 被调用时（例如 SIGUSR1 热重启），generation 递增。旧的 in-flight 任务完成时检测到 generation 不匹配，不会触发后续泵送，避免状态错乱。 
 
 ---
 
